@@ -1,0 +1,4 @@
+*data/
+src/formation_run_analysis.csv
+*.csv
+*.keras
