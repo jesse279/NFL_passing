@@ -2,3 +2,9 @@
 src/formation_run_analysis.csv
 *.csv
 *.keras
+*.h5
+*.png
+*.gif
+*.mp4
+*.avi
+*.mov
