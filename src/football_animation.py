@@ -73,6 +73,26 @@ def get_play_data(game_id: int, play_id: int,
         (df_tracking['gameId'] == game_id) & 
         (df_tracking['playId'] == play_id)
     ].copy()
+
+    # Field dimensions
+    FIELD_LENGTH = 120.0
+    FIELD_WIDTH = 53.3
+
+
+
+    # Mask for plays going left
+    left_mask = play_tracking['playDirection'] == 'left'
+
+    # Flip x and y positions
+    play_tracking.loc[left_mask, 'x'] = FIELD_LENGTH - play_tracking.loc[left_mask, 'x']
+    play_tracking.loc[left_mask, 'y'] = FIELD_WIDTH - play_tracking.loc[left_mask, 'y']
+
+    # Flip orientation and direction: (angle mirror)
+    play_tracking.loc[left_mask, 'o'] = (180 + play_tracking.loc[left_mask, 'o']) % 360
+    play_tracking.loc[left_mask, 'dir'] = (180 + play_tracking.loc[left_mask, 'dir']) % 360
+
+    # After flipping, you can optionally set all directions to "right"
+    play_tracking['playDirection'] = 'right'
     
     # Get player info
     play_players = df_players.copy()
@@ -152,8 +172,8 @@ def animate_play(game_id: int, play_id: int,
         yards_to_go = play_info['yardsToGo']
         
         # Get team info
-        home_team = play_info['possessionTeam']
-        away_team = play_info['defensiveTeam']
+        pos_team = play_info['possessionTeam']
+        def_team = play_info['defensiveTeam']
         
         # Calculate line of scrimmage and first down marker
         yardline_side = play_info['yardlineSide']
@@ -161,28 +181,27 @@ def animate_play(game_id: int, play_id: int,
         
         # Convert to absolute yard line (0-100 scale)
         # The yardline_number is how many yards from the endzone
-        if yardline_side == home_team:
+        if yardline_side == pos_team:
             los_x = yardline_number  # Already in correct format
             # First down is always in the direction of the endzone
             first_down_x = los_x + yards_to_go if yardline_number < 50 else los_x - yards_to_go
         else:
             los_x = 100 - yardline_number  # Convert from opponent's perspective
             # First down is always in the direction of the endzone
-            first_down_x = los_x - yards_to_go if yardline_number < 50 else los_x + yards_to_go
-            
+            first_down_x = los_x + yards_to_go if yardline_number < 50 else los_x - yards_to_go
+        first_down_x = los_x + yards_to_go
         # Calculate next play line (if yards were gained)
-        if yards_gained > 0:
-            if yardline_side == home_team:
-                next_play_x = los_x + yards_gained
-            else:
-                next_play_x = los_x - yards_gained
+        if yards_gained != 0:
+
+            next_play_x = los_x + yards_gained
         else:
             next_play_x = los_x  # No gain or incomplete
-            
+        
         # Ensure lines are within field bounds
         los_x = max(0, min(100, los_x))
         first_down_x = max(0, min(100, first_down_x))
         next_play_x = max(0, min(100, next_play_x))
+
         
     except (KeyError, IndexError):
         los_x = 40  # Default to 40 yard line
@@ -193,7 +212,7 @@ def animate_play(game_id: int, play_id: int,
         down = 1
         yards_to_go = 10
         home_team = 'HOME'
-        away_team = 'AWAY'
+        def_team = 'AWAY'
     
     los.set_xdata([los_x, los_x])
     first_down.set_xdata([first_down_x, first_down_x])
@@ -202,7 +221,7 @@ def animate_play(game_id: int, play_id: int,
     # Create title text
     title_text = f"Game {game_id}, Play {play_id}\n"
     title_text += f"{play_description}\n"
-    title_text += f"Down: {down}, Distance: {yards_to_go} yards, Gain: {yards_gained} yards"
+    title_text += f"Down: {down}, Distance: {yards_to_go} yards, on the {yardline_number} Gain: {yards_gained} yards"
     print("Title: ", title_text)
     
     # Create a text object for the title
@@ -241,7 +260,7 @@ def animate_play(game_id: int, play_id: int,
         players.set_offsets(np.c_[players_data['x'] - 10, players_data['y']])
         
         # Set team colors
-        colors = ['red' if team == home_team else 'blue' 
+        colors = ['red' if team == pos_team else 'blue' 
                  for team in players_data['club']]
         players.set_color(colors)
         
@@ -318,8 +337,8 @@ def main():
     df_games = pd.read_csv('data/games.csv')
     
     # Example game and play IDs
-    game_id = 2022091200
-    play_id = 180
+    game_id = 2022091200														#	2022091200
+    play_id = 2613
     #  64,   85,  109,  156,  180,  201,  264,  286,  315,  346,  375,
     #     401,  446,  467,  565,  601,  622,  643,  664,  688,  716,  741,
     #     762,  786,  810,  882,  910,  931,  983, 1004, 1028, 1057, 1092,
