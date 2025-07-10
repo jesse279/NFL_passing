@@ -18,6 +18,7 @@ class PlayEvent:
     event_type: str
     phase: PlayPhase
 
+
 class PlayAnalyzer:
     def __init__(self, 
                  df_tracking: pd.DataFrame,
@@ -34,12 +35,12 @@ class PlayAnalyzer:
         # Define key events for different phases
         self.pre_snap_events = ['huddle_start_offense','huddle_break_offense', 'line_set', 'man_in_motion', 'shift']
         self.snap_events = ['ball_snap', 'snap_direct']
-        self.pass_events = ['pass_forward','pass_shovel']
+        self.pass_events = ['pass_forward','pass_shovel', 'run', 'qb_sack']
         self.play_end_events = ['tackle', 'touchdown', 'pass_outcome_incomplete','out_of_bounds','qb_sack', 'touchback', 'qb_kneel', 'play_submit','qb_spike',]
         self.run_events = ['handoff']
         self.post_snap_events = [ 'run_pass_option','pass_arrived', 'pass_outcome_caught',  'first_contact', 'dropped_pass', 'play_action', 'run', 'pass_tipped', 'fumble', 'fumble_offense_recovered', 'fumble_defense_recovered','qb_strip_sack', 'lateral']
 
-        self.predict_events = ['pass_forward','run', 'qb_sack', 'pass_outcome_incomplete', 'pass_outcome_caught', 'pass_tipped', 'pass_outcome_interception', 'pass_outcome_touchdown']
+        self.predict_events = ['pass_forward', 'pass_outcome_incomplete', 'pass_outcome_caught', 'pass_tipped', 'pass_outcome_interception', 'pass_outcome_touchdown']
             
     def get_play_events(self, game_id: int, play_id: int) -> List[PlayEvent]:
         """Get all events for a specific play in chronological order."""
@@ -89,7 +90,7 @@ class PlayAnalyzer:
         
         return player_data
     
-    def extract_play_features(self, 
+    def  extract_play_features(self, 
                             game_id: int, 
                             play_id: int,
                             start_phase: PlayPhase = PlayPhase.POST_SNAP,
@@ -110,6 +111,9 @@ class PlayAnalyzer:
         # Find start and end frames
         start_frame = next((e.frame_id for e in events if e.phase == start_phase), None)
         end_frame = next((e.frame_id for e in events if e.phase == end_phase), None)
+        if end_frame is None:
+            end_frame = next((e.frame_id for e in events if e.phase == PlayPhase.PLAY_END), None)
+
         if not start_frame or not end_frame:
             raise ValueError(f"Could not find {start_phase} or {end_phase} phase for play")
         
@@ -138,6 +142,24 @@ class PlayAnalyzer:
         
         # Combine all frames
         play_data = pd.concat(frames_data)
+        yardline_side = play_info["yardlineSide"]
+        pos_team = play_info["possessionTeam"]
+        yardline_number = play_info["yardlineNumber"]
+
+
+                # Adjust x to be relative to line of scrimmage
+        if yardline_side == pos_team:
+            los_x = 100 - yardline_number  # Already in correct format
+            # First down is always in the direction of the endzone
+        else:
+            los_x = yardline_number  # Convert from opponent's perspective
+            # First down is always in the direction of the endzone
+        play_data['x_relative'] = play_data['x'] + los_x - 110
+
+        # Optionally include LOS and yards to endzone as context
+        play_data['line_of_scrimmage'] = los_x
+        play_data['yards_to_endzone'] = 100 - play_info['yardlineNumber']  # assuming offense always drives right
+
         
         # Create metadata dictionary
         metadata = {
@@ -148,13 +170,49 @@ class PlayAnalyzer:
             'play_type': play_info['passResult'],
             'down': play_info['down'],
             'yards_to_go': play_info['yardsToGo'],
+            'line_of_scrimmage': los_x,
             'yards_gained': play_info['yardsGained'],
             'pass_result': play_info.get('passResult', None),
             'targeted_receiver_nflId': targeted_receiver,
             'time_to_throw': end_frame - start_frame if 'pass_forward' in [e.event_type for e in events] else None
         }
         
-        return play_data, metadata
+        # Pivot: one row per frame, all players as columns
+        players_by_frame = []
+        for frame_id, frame_df in play_data.groupby("frameId"):
+            offense_roles = ["QB", "C", "G", "T", "FB", "RB", "TE", "WR"]
+            defense_roles = ["NT", "DT", "DE", "OLB", "MLB", "ILB", "LB", "CB", "DB", "SS", "FS"]
+            pos_rank = {pos: i for i, pos in enumerate(offense_roles + defense_roles)}
+            frame_df["pos_rank"] = frame_df["position"].map(pos_rank).fillna(999)
+
+            frame_flat = frame_df.sort_values(
+                by=["pos_rank", "nflId"], ascending=[True, True]).reset_index(drop=True)
+
+            # Sorting helper
+
+            
+            # Flatten player features
+            flat_features = {}
+            for i, row in frame_flat.iterrows():
+                
+                prefix = f"player_{i}"
+                for col in ["nflId", "displayName_x","position", "x", "x_relative", "y", "s", "a", "dis", "o", "dir"]:
+                    flat_features[f"{prefix}_{col}"] = row[col]
+            
+            # Add metadata for the frame
+            flat_features.update({
+                "gameId": game_id,
+                "playId": play_id,
+                "frameId": frame_id,
+                "yards_to_go": play_info['yardsToGo'],
+                "down": play_info['down'],
+                "los": los_x
+            })
+            players_by_frame.append(flat_features)
+
+        flat_df = pd.DataFrame(players_by_frame)
+
+        return flat_df, metadata
     
     def create_training_dataset(self,
                               start_phase: PlayPhase = PlayPhase.POST_SNAP,
@@ -170,14 +228,16 @@ class PlayAnalyzer:
         X_data = []
         y_data = []
         
+        
         # Get all passing plays
         passing_plays = self.df_plays[self.df_plays['isDropback'] == True]
-        week_1_games = self.df_tracking["gameId"].unique()
+        # passing_plays = passing_plays.head(10)
+        week_games = self.df_tracking["gameId"].unique()
         for _, play in passing_plays.iterrows():
             try:
                 # Extract features for this play
                 game_id = play['gameId']
-                if game_id not in week_1_games:
+                if game_id not in week_games: #fixme 
                     continue
                 play_features, metadata = self.extract_play_features(
                     game_id,
@@ -185,19 +245,18 @@ class PlayAnalyzer:
                     start_phase,
                     end_phase
                 )
-                
+                # print(play_features.shape)
                 # Add to dataset
                 X_data.append(play_features)
                 y_data.append(metadata)
                 
             except ValueError as e:
-                print(f"Skipping play {play['playId']}: {str(e)}")
+                print(f"Skipping play {game_id}, {play['playId']}: {str(e)}")
                 continue
         
         # Combine all plays
         X = pd.concat(X_data, ignore_index=True)
         y = pd.DataFrame(y_data)
-        
         return X, y
 
 def main():
@@ -205,14 +264,19 @@ def main():
     os.makedirs('data', exist_ok=True)
     
     # Initialize output files with headers
-    X_headers = pd.DataFrame(columns=['gameId', 'playId', 'frameId', 'nflId', 'displayName', 'position','club', 'x', 'y', 's', 'a', 'dis', 'o', 'dir'])
-    y_headers = pd.DataFrame(columns=['game_id', 'play_id', 'start_frame', 'end_frame', 'play_type', 'down', 'yards_to_go', 'yards_gained', 'pass_result', 'targeted_receiver_nflId', 'time_to_throw'])
+    # X_headers = pd.DataFrame(columns=['gameId', 'playId', 'frameId', 'nflId', 'displayName', 'position','club', 'x', 'y', 's', 'a', 'dis', 'o', 'dir'])
+    X_headers = pd.DataFrame()
+    # columns=['game_id', 'play_id', 'start_frame', 'end_frame', 'play_type', 'down', 'yards_to_go', 'yards_gained', 'pass_result', 'targeted_receiver_nflId', 'time_to_throw']
+    y_headers = pd.DataFrame()
     
+
+
+
     X_headers.to_csv('data/play_features.csv', index=False)
     y_headers.to_csv('data/play_outcomes.csv', index=False)
     
     # Process each week
-    for week in range(1, 10):
+    for week in range(1, 10): #fixme extend to 10
         print(f"Processing week {week}...")
         
         # Load data for current week
@@ -221,6 +285,16 @@ def main():
         df_plays = pd.read_csv('data/plays.csv')
         df_games = pd.read_csv('data/games.csv')
         df_player_plays = pd.read_csv('data/player_play.csv')
+
+        FIELD_LENGTH = 120.0
+        FIELD_WIDTH = 53.3
+
+        left_mask = df_tracking['playDirection'] == 'left'
+        df_tracking.loc[left_mask, 'x'] = FIELD_LENGTH - df_tracking.loc[left_mask, 'x']
+        df_tracking.loc[left_mask, 'y'] = FIELD_WIDTH - df_tracking.loc[left_mask, 'y']
+        df_tracking.loc[left_mask, 'o'] = (180 + df_tracking.loc[left_mask, 'o']) % 360
+        df_tracking.loc[left_mask, 'dir'] = (180 + df_tracking.loc[left_mask, 'dir']) % 360
+        df_tracking['playDirection'] = 'right'
         
         # Create analyzer
         analyzer = PlayAnalyzer(df_tracking, df_players, df_plays, df_games, df_player_plays)
@@ -228,11 +302,12 @@ def main():
         # Create training dataset for current week
         print(f"Creating training dataset for week {week}...")
         X, y = analyzer.create_training_dataset()
+        print(X.columns)
         
         # Append to output files
         print(f"Appending week {week} data to output files...")
-        X.to_csv('data/play_features.csv', mode='a', header=False, index=False)
-        y.to_csv('data/play_outcomes.csv', mode='a', header=False, index=False)
+        X.to_csv('data/play_features.csv', mode='a', header=True, index=False)
+        y.to_csv('data/play_outcomes.csv', mode='a', header=True, index=False)
         
         # Clear memory
         del df_tracking, df_players, df_plays, df_games, df_player_plays, analyzer, X, y
@@ -240,6 +315,7 @@ def main():
         gc.collect()
         
         print(f"Completed week {week}")
+        
     
     print("All weeks processed successfully!")
 
