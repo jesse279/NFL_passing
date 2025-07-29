@@ -122,6 +122,47 @@ class PlayAnalyzer:
             (self.df_plays['gameId'] == game_id) & 
             (self.df_plays['playId'] == play_id)
         ].iloc[0]
+
+
+                # Determine score differential relative to possession team
+        home_team = self.df_games[self.df_games['gameId'] == game_id]['homeTeamAbbr'].values[0]
+        away_team = self.df_games[self.df_games['gameId'] == game_id]['visitorTeamAbbr'].values[0]
+        pos_team = play_info["possessionTeam"]
+
+        
+
+        home_score = play_info['preSnapHomeScore']
+        away_score = play_info['preSnapVisitorScore']
+
+        if pos_team == home_team:
+            score_diff = home_score - away_score
+        else:
+            score_diff = away_score - home_score
+
+        win_prob_home = play_info.get('preSnapHomeTeamWinProbability', np.nan)
+        win_prob_visitor = play_info.get('preSnapVisitorTeamWinProbability', np.nan)
+
+        win_prob_possession = win_prob_home if pos_team == home_team else win_prob_visitor
+
+        quarter = play_info['quarter']
+        is_first_half = quarter in [1, 2]
+
+        game_clock_str = play_info['gameClock']  # e.g. "1:54:00 AM" -> should be "MM:SS" or "HH:MM:SS"
+        # Parse the gameClock
+        try:
+            minutes, seconds = map(int, game_clock_str.split(":")[:2])
+            seconds_remaining = minutes * 60 + seconds
+        except:
+            seconds_remaining = np.nan
+            print("can't extract time")
+
+        if quarter in [1, 3]:
+            seconds_to_half = seconds_remaining + 15 * 60  # end of half is end of Q2 or Q4
+        else:
+            seconds_to_half = seconds_remaining
+
+
+
         
         # Get targeted receiver from player_plays
         targeted_receiver = self.df_player_plays[
@@ -160,6 +201,11 @@ class PlayAnalyzer:
         play_data['line_of_scrimmage'] = los_x
         play_data['yards_to_endzone'] = 100 - play_info['yardlineNumber']  # assuming offense always drives right
 
+        caused_pressure_count = self.df_player_plays[
+            (self.df_player_plays['gameId'] == game_id) &
+            (self.df_player_plays['playId'] == play_id)
+        ]['causedPressure'].sum()
+
         
         # Create metadata dictionary
         metadata = {
@@ -174,30 +220,85 @@ class PlayAnalyzer:
             'yards_gained': play_info['yardsGained'],
             'pass_result': play_info.get('passResult', None),
             'targeted_receiver_nflId': targeted_receiver,
-            'time_to_throw': end_frame - start_frame if 'pass_forward' in [e.event_type for e in events] else None
+            'time_to_throw': end_frame - start_frame if 'pass_forward' in [e.event_type for e in events] else None,
+            'score_differential': score_diff,
+            'win_probability': win_prob_possession,
+            'first_half': is_first_half,
+            'quarter': quarter,
+            'seconds_to_half': seconds_to_half,
+            'offense_formation': play_info.get('offenseFormation', None),        
+            'receiver_alignment': play_info.get('receiverAlignment', None),
+            'play_clock_at_snap': play_info.get('playClockAtSnap', None),
+            'play_action': play_info.get('playAction', None),
+            'dropback_type': play_info.get('dropbackType', None),
+            'unblocked_pressure': play_info.get('unblockedPressure', None),
+            'pff_pass_coverage': play_info.get('pff_passCoverage', None),
+            'pff_man_zone': play_info.get('pff_manZone', None),
+            'caused_pressure_count': caused_pressure_count,
+
+
+
+
+
+
+
+
         }
         
         # Pivot: one row per frame, all players as columns
         players_by_frame = []
         for frame_id, frame_df in play_data.groupby("frameId"):
-            offense_roles = ["QB", "C", "G", "T", "FB", "RB", "TE", "WR"]
+            offense_roles = ["QB", "WR", "TE", "RB", "FB", "C", "G", "T",]
             defense_roles = ["NT", "DT", "DE", "OLB", "MLB", "ILB", "LB", "CB", "DB", "SS", "FS"]
             pos_rank = {pos: i for i, pos in enumerate(offense_roles + defense_roles)}
-            frame_df["pos_rank"] = frame_df["position"].map(pos_rank).fillna(999)
+            # Merge in wasRunningRoute to prioritize eligible receivers
+            running_route_df = self.df_player_plays[
+                (self.df_player_plays['gameId'] == game_id) &
+                (self.df_player_plays['playId'] == play_id)
+            ][['nflId', 'wasRunningRoute']]
 
-            frame_flat = frame_df.sort_values(
-                by=["pos_rank", "nflId"], ascending=[True, True]).reset_index(drop=True)
+            frame_df = frame_df.merge(running_route_df, on='nflId', how='left')
+            frame_df['wasRunningRoute'] = frame_df['wasRunningRoute'].fillna(False)
+
+            # Sort: dropback QB first, then eligible receivers (wasRunningRoute), then by pos_rank
+            dropback_nflId = self.df_player_plays[
+                (self.df_player_plays['gameId'] == game_id) &
+                (self.df_player_plays['playId'] == play_id) &
+                (self.df_player_plays['hadDropback'] == True)
+            ]['nflId'].iloc[0] if len(self.df_player_plays[
+                (self.df_player_plays['gameId'] == game_id) &
+                (self.df_player_plays['playId'] == play_id) &
+                (self.df_player_plays['hadDropback'] == True)
+            ]) > 0 else None
+
+            frame_df["pos_rank"] = frame_df["position"].map(pos_rank).fillna(999)
+            frame_df['is_dropback'] = frame_df['nflId'] == dropback_nflId
+            frame_df = frame_df.sort_values(
+                by=["is_dropback", "wasRunningRoute", "pos_rank", "nflId"],
+                ascending=[False, False, True, True]
+            ).reset_index(drop=True)
+
 
             # Sorting helper
 
             
             # Flatten player features
             flat_features = {}
-            for i, row in frame_flat.iterrows():
+            for i, row in frame_df.iterrows():
                 
                 prefix = f"player_{i}"
                 for col in ["nflId", "displayName_x","position", "x", "x_relative", "y", "s", "a", "dis", "o", "dir"]:
                     flat_features[f"{prefix}_{col}"] = row[col]
+                if 1 <= i <= 5:
+                    route_info = self.df_player_plays[
+                        (self.df_player_plays['gameId'] == game_id) &
+                        (self.df_player_plays['playId'] == play_id) &
+                        (self.df_player_plays['nflId'] == row['nflId'])
+                    ]
+                    route_ran = route_info['routeRan'].values[0] if 'routeRan' in route_info and len(route_info) > 0 else None
+                    flat_features[f"{prefix}_route"] = route_ran
+
+
             
             # Add metadata for the frame
             flat_features.update({
@@ -272,15 +373,15 @@ def main():
 
 
 
-    X_headers.to_csv('data/play_features.csv', index=False)
-    y_headers.to_csv('data/play_outcomes.csv', index=False)
+    X_headers.to_csv('data/play_features_2.csv', index=False)
+    y_headers.to_csv('data/play_outcomes_2.csv', index=False)
     
     # Process each week
     for week in range(1, 10): #fixme extend to 10
         print(f"Processing week {week}...")
         
         # Load data for current week
-        df_tracking = pd.read_csv(f'data/tracking_week_{week}.csv')
+        df_tracking = pd.read_csv(f'data/tracking_week_{week}.csv')#.head(100000) #fixme
         df_players = pd.read_csv('data/players.csv')
         df_plays = pd.read_csv('data/plays.csv')
         df_games = pd.read_csv('data/games.csv')
@@ -306,8 +407,8 @@ def main():
         
         # Append to output files
         print(f"Appending week {week} data to output files...")
-        X.to_csv('data/play_features.csv', mode='a', header=True, index=False)
-        y.to_csv('data/play_outcomes.csv', mode='a', header=True, index=False)
+        X.to_csv('data/play_features_2.csv', mode='a', header=True, index=False)
+        y.to_csv('data/play_outcomes_2.csv', mode='a', header=True, index=False)
         
         # Clear memory
         del df_tracking, df_players, df_plays, df_games, df_player_plays, analyzer, X, y

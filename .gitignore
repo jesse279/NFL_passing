@@ -1,6 +1,6 @@
 *data/
 src/formation_run_analysis.csv
-*models
+*models/
 *.csv
 *.keras
 *.h5
